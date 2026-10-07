@@ -3,7 +3,7 @@ Interactive demo script for the multi-agent system.
 This script provides a command-line interface to interact with the agents.
 """
 
-from multi_agent_system import MultiAgentSystem
+from multi_agent_system import create_system
 import json
 
 
@@ -41,7 +41,7 @@ def main():
     print("=" * 50)
     
     # Initialize system
-    system = MultiAgentSystem()
+    system = create_system()
     
     while True:
         print("\n🎯 Choose an option:")

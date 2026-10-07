@@ -1,17 +1,59 @@
 from typing import List, Dict, Any, Optional
-from langchain.llms import Ollama
-from langchain.prompts import PromptTemplate
-from langchain.schema import BaseOutputParser, Document
-from langchain.chains import LLMChain
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import FAISS
-from langchain.embeddings import OllamaEmbeddings
-from langchain.document_loaders import TextLoader, DirectoryLoader
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import BaseOutputParser
+from langchain_core.documents import Document
+from langchain_core.runnables import Runnable
+from langchain_core.embeddings import Embeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import TextLoader, DirectoryLoader
 from pydantic import BaseModel, Field
 import json
 import time
 import os
 from pathlib import Path
+
+from config import (
+    OLLAMA_MODEL, OLLAMA_EMBEDDING_MODEL, OLLAMA_BASE_URL, AGENT_SETTINGS, WORKFLOW_SETTINGS,
+)
+
+
+def build_ollama_llm(model_name: Optional[str] = None) -> Runnable:
+    """Default LLM: a local Ollama model (imported lazily so the module works without Ollama)."""
+    from langchain_ollama import OllamaLLM
+
+    return OllamaLLM(
+        model=model_name or OLLAMA_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        temperature=AGENT_SETTINGS["temperature"],
+    )
+
+
+def build_ollama_embeddings(model_name: Optional[str] = None) -> Embeddings:
+    """Default embeddings: Ollama (lazy import, see build_ollama_llm)."""
+    from langchain_ollama import OllamaEmbeddings
+
+    return OllamaEmbeddings(model=model_name or OLLAMA_EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
+
+
+def to_content(result: Any) -> str:
+    """Serialise a parsed model reply as *JSON* text (the UI and CLI call json.loads on it).
+
+    The parser returns a dict; ``str(dict)`` is a Python repr with single quotes, which
+    is not valid JSON and made every structured view fall back to raw text.
+    """
+    if isinstance(result, (dict, list)):
+        return json.dumps(result, ensure_ascii=False)
+    return str(result)
+
+
+def extract_score(review_json: str) -> Optional[float]:
+    """Read the critic's numeric score (1-10) from its JSON reply; None if absent/unparseable."""
+    try:
+        value = json.loads(review_json).get("score")
+        return float(value)
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 class AgentResponse(BaseModel):
@@ -43,18 +85,24 @@ class JSONOutputParser(BaseOutputParser):
 class BaseAgent:
     """Base class for all agents in the system"""
     
-    def __init__(self, name: str, model_name: str = "llama3.1:8b"):
+    def __init__(self, name: str, model_name: Optional[str] = None, llm: Optional[Runnable] = None):
         self.name = name
-        self.llm = Ollama(model=model_name, temperature=0.7)
+        # `llm` can be any LangChain LLM/runnable (tests and the offline demo inject one);
+        # by default a local Ollama model is used.
+        self.llm = llm if llm is not None else build_ollama_llm(model_name)
         self.output_parser = JSONOutputParser()
     
-    def _create_chain(self, template: str) -> LLMChain:
-        """Create a LangChain chain with the given template"""
+    def _create_chain(self, template: str) -> Runnable:
+        """Create an LCEL chain (prompt | llm | parser) with the given template"""
         prompt = PromptTemplate(
             template=template,
             input_variables=["input", "context"]
         )
-        return LLMChain(llm=self.llm, prompt=prompt, output_parser=self.output_parser)
+        return prompt | self.llm | self.output_parser
+    
+    def _run_chain(self, input_text: str, context: str) -> str:
+        """Invoke the chain and return the reply as JSON text."""
+        return to_content(self.chain.invoke({"input": input_text, "context": context}))
     
     def process(self, input_text: str, context: str = "") -> AgentResponse:
         """Process input and return standardized response"""
@@ -64,9 +112,10 @@ class BaseAgent:
 class RAGAgent(BaseAgent):
     """Agent specialized in Retrieval-Augmented Generation"""
     
-    def __init__(self, documents_path: Optional[str] = None):
-        super().__init__("RAG Agent")
-        self.embeddings = OllamaEmbeddings(model="llama3.1:8b")
+    def __init__(self, documents_path: Optional[str] = None, llm: Optional[Runnable] = None,
+                 embeddings: Optional[Embeddings] = None):
+        super().__init__("RAG Agent", llm=llm)
+        self.embeddings = embeddings if embeddings is not None else build_ollama_embeddings()
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
@@ -177,14 +226,15 @@ Response:"""
         full_context = f"{context}\n\nRetrieved Information:\n{retrieved_context}" if context else retrieved_context
         
         # Generate response using the chain
-        result = self.chain.run(input=input_text, context=full_context)
+        result = self._run_chain(input_text, full_context)
         
         return AgentResponse(
             agent_name=self.name,
-            content=str(result),
+            content=result,
             metadata={
                 "task_type": "rag_query",
                 "retrieved_docs_count": len(relevant_docs),
+                "retrieved_sources": [d.metadata.get("source", "unknown") for d in relevant_docs],
                 "has_vectorstore": self.vectorstore is not None,
                 "input_query": input_text
             }
@@ -194,8 +244,8 @@ Response:"""
 class ResearchAgent(BaseAgent):
     """Agent specialized in conducting research and gathering information with RAG support"""
     
-    def __init__(self, rag_agent: Optional[RAGAgent] = None):
-        super().__init__("Research Agent")
+    def __init__(self, rag_agent: Optional[RAGAgent] = None, llm: Optional[Runnable] = None):
+        super().__init__("Research Agent", llm=llm)
         self.rag_agent = rag_agent
         
         template = """You are a research specialist. Your task is to conduct thorough research on the given topic.
@@ -231,11 +281,11 @@ Research Summary:"""
             rag_response = self.rag_agent.process(input_text)
             enhanced_context = f"{context}\n\nRAG Retrieved Information:\n{rag_response.content}"
         
-        result = self.chain.run(input=input_text, context=enhanced_context)
+        result = self._run_chain(input_text, enhanced_context)
         
         return AgentResponse(
             agent_name=self.name,
-            content=str(result),
+            content=result,
             metadata={
                 "task_type": "research", 
                 "input_topic": input_text,
@@ -247,8 +297,8 @@ Research Summary:"""
 class WriterAgent(BaseAgent):
     """Agent specialized in creating written content"""
     
-    def __init__(self):
-        super().__init__("Writer Agent")
+    def __init__(self, llm: Optional[Runnable] = None):
+        super().__init__("Writer Agent", llm=llm)
         
         template = """You are a professional writer. Your task is to create high-quality content based on the research provided.
 
@@ -275,11 +325,11 @@ Article:"""
         self.chain = self._create_chain(template)
     
     def process(self, input_text: str, context: str = "") -> AgentResponse:
-        result = self.chain.run(input=input_text, context=context)
+        result = self._run_chain(input_text, context)
         
         return AgentResponse(
             agent_name=self.name,
-            content=str(result),
+            content=result,
             metadata={"task_type": "writing", "input_topic": input_text}
         )
 
@@ -287,8 +337,8 @@ Article:"""
 class CriticAgent(BaseAgent):
     """Agent specialized in reviewing and providing feedback"""
     
-    def __init__(self):
-        super().__init__("Critic Agent")
+    def __init__(self, llm: Optional[Runnable] = None):
+        super().__init__("Critic Agent", llm=llm)
         
         template = """You are a professional critic and editor. Your task is to review the content and provide constructive feedback.
 
@@ -317,11 +367,11 @@ Review:"""
         self.chain = self._create_chain(template)
     
     def process(self, input_text: str, context: str = "") -> AgentResponse:
-        result = self.chain.run(input=input_text, context=context)
+        result = self._run_chain(input_text, context)
         
         return AgentResponse(
             agent_name=self.name,
-            content=str(result),
+            content=result,
             metadata={"task_type": "review", "input_topic": input_text}
         )
 
@@ -329,12 +379,13 @@ Review:"""
 class CoordinatorAgent(BaseAgent):
     """Agent that coordinates the workflow between other agents with RAG support"""
     
-    def __init__(self, rag_agent: Optional[RAGAgent] = None):
-        super().__init__("Coordinator Agent")
+    def __init__(self, rag_agent: Optional[RAGAgent] = None, llm: Optional[Runnable] = None):
+        super().__init__("Coordinator Agent", llm=llm)
         self.rag_agent = rag_agent
-        self.research_agent = ResearchAgent(rag_agent)
-        self.writer_agent = WriterAgent()
-        self.critic_agent = CriticAgent()
+        # one shared LLM for all agents
+        self.research_agent = ResearchAgent(rag_agent, llm=self.llm)
+        self.writer_agent = WriterAgent(llm=self.llm)
+        self.critic_agent = CriticAgent(llm=self.llm)
     
     def orchestrate_workflow(self, topic: str) -> Dict[str, AgentResponse]:
         """Orchestrate the complete workflow from research to final content"""
@@ -360,22 +411,41 @@ class CoordinatorAgent(BaseAgent):
         print(f"📊 Research summary: {research_response.content[:100]}...")
         print()
         
-        # Step 2: Writing
-        print("✍️ Phase 2: Writer Agent creating content...")
+        # Step 2 + 3: Writing and review, with the revision loop config.py promises
         writer_context = research_response.content
         if rag_response:
             writer_context = f"{research_response.content}\n\nAdditional RAG Context:\n{rag_response.content}"
-        writer_response = self.writer_agent.process(topic, writer_context)
-        print(f"✅ Content created by {writer_response.agent_name}")
-        print(f"📝 Content preview: {writer_response.content[:100]}...")
-        print()
         
-        # Step 3: Review
-        print("🔍 Phase 3: Critic Agent reviewing content...")
-        critic_response = self.critic_agent.process(topic, writer_response.content)
-        print(f"✅ Review completed by {critic_response.agent_name}")
-        print(f"📋 Review summary: {critic_response.content[:100]}...")
-        print()
+        max_rounds = max(1, int(WORKFLOW_SETTINGS["max_iterations"])) \
+            if WORKFLOW_SETTINGS["enable_iterative_improvement"] else 1
+        threshold = float(WORKFLOW_SETTINGS["quality_threshold"])
+        scores: List[Optional[float]] = []
+        feedback = ""
+        for round_no in range(1, max_rounds + 1):
+            print(f"✍️ Phase 2 (round {round_no}): Writer Agent creating content...")
+            context = writer_context if not feedback else f"{writer_context}\n\nReviewer feedback:\n{feedback}"
+            writer_response = self.writer_agent.process(topic, context)
+            print(f"✅ Content created by {writer_response.agent_name}")
+            print(f"📝 Content preview: {writer_response.content[:100]}...")
+            
+            print(f"🔍 Phase 3 (round {round_no}): Critic Agent reviewing content...")
+            critic_response = self.critic_agent.process(topic, writer_response.content)
+            score = extract_score(critic_response.content)
+            scores.append(score)
+            print(f"✅ Review completed by {critic_response.agent_name} (score: {score})")
+            print(f"📋 Review summary: {critic_response.content[:100]}...")
+            print()
+            if score is None or score >= threshold:
+                break
+            feedback = critic_response.content
+        
+        # Keep the result shape unchanged for callers; revision info lives in metadata
+        critic_response.metadata.update({
+            "revision_rounds": len(scores),
+            "scores_by_round": scores,
+            "quality_threshold": threshold,
+            "met_threshold": bool(scores and scores[-1] is not None and scores[-1] >= threshold),
+        })
         
         # Step 4: Final coordination
         print("🎯 Phase 4: Coordinator finalizing workflow...")
@@ -408,15 +478,28 @@ class CoordinatorAgent(BaseAgent):
         )
 
 
+def create_system(documents_path: Optional[str] = None) -> "MultiAgentSystem":
+    """Build the system: scripted offline models if MULTI_AGENT_OFFLINE=1, else local Ollama."""
+    from offline import is_offline, ScriptedLLM, HashingEmbeddings
+
+    if is_offline():
+        print("⚠️  OFFLINE MODE: scripted replies, not a real language model")
+        return MultiAgentSystem(documents_path, llm=ScriptedLLM(), embeddings=HashingEmbeddings())
+    return MultiAgentSystem(documents_path)
+
+
 class MultiAgentSystem:
     """Main system that manages all agents and provides the interface with RAG support"""
     
-    def __init__(self, documents_path: Optional[str] = None):
-        # Initialize RAG agent
-        self.rag_agent = RAGAgent(documents_path) if documents_path else RAGAgent()
+    def __init__(self, documents_path: Optional[str] = None, llm: Optional[Runnable] = None,
+                 embeddings: Optional[Embeddings] = None):
+        # `llm` / `embeddings` default to local Ollama models; pass your own (or the
+        # scripted ones from offline.py) to run without Ollama.
+        self.embeddings_name = type(embeddings).__name__ if embeddings is not None else OLLAMA_EMBEDDING_MODEL
+        self.rag_agent = RAGAgent(documents_path, llm=llm, embeddings=embeddings)
         
-        # Initialize coordinator with RAG support
-        self.coordinator = CoordinatorAgent(self.rag_agent)
+        # Initialize coordinator with RAG support (all agents share one LLM)
+        self.coordinator = CoordinatorAgent(self.rag_agent, llm=llm if llm is not None else self.rag_agent.llm)
         
         # Update agents dictionary
         self.agents = {
@@ -456,7 +539,7 @@ class MultiAgentSystem:
         return {
             "has_vectorstore": self.rag_agent.vectorstore is not None,
             "documents_count": len(self.rag_agent.documents),
-            "embeddings_model": "llama3.1:8b"
+            "embeddings_model": self.embeddings_name
         }
 
 
@@ -467,7 +550,7 @@ def main():
     print("=" * 60)
     
     # Initialize the system
-    system = MultiAgentSystem()
+    system = create_system()
     
     # Add some sample documents to demonstrate RAG
     sample_documents = [

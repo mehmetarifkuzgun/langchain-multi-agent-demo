@@ -1,146 +1,105 @@
-# Multi-Agent System with LangChain, Ollama, and RAG
+# Multi-Agent System with LangChain, Ollama and RAG
 
-A sophisticated multi-agent system that combines LangChain, Ollama's Llama3.1:8b model, and Retrieval-Augmented Generation (RAG) for intelligent content creation and document analysis.
+[![CI](https://github.com/mehmetarifkuzgun/langchain-multi-agent-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/mehmetarifkuzgun/langchain-multi-agent-demo/actions/workflows/ci.yml)
 
-## 🚀 Features
+Five cooperating agents (RAG, Research, Writer, Critic, Coordinator) built on LangChain LCEL. A FAISS
+vector store grounds the answers in your documents, and a critic → writer **revision loop** improves the
+article until it clears a quality threshold. Runs against a local Ollama model, or fully offline with a
+scripted stand-in so you can try it (and run the tests) without any model.
 
-### Core Agents
-- **RAG Agent**: Document retrieval and knowledge-augmented responses using FAISS vector store
-- **Research Agent**: Conducts comprehensive topic research with RAG enhancement
-- **Writer Agent**: Creates structured content (articles, reports) based on research findings
-- **Critic Agent**: Reviews and scores content with detailed feedback (1-10 scale)
-- **Coordinator Agent**: Orchestrates multi-phase workflows with progress tracking
+![Streamlit UI after a complete workflow run](docs/img/streamlit-results.png)
 
-### Advanced Capabilities
-- **Vector-based Document Retrieval**: FAISS integration for semantic search
-- **JSON-structured Responses**: Standardized output format across all agents
-- **Interactive Interfaces**: Both command-line and Streamlit web UI
-- **Document Management**: Load from files/directories or add documents programmatically
-- **Workflow Visualization**: Real-time progress tracking and results display
+> **Honesty note on the screenshot.** It was captured from the real Streamlit app in **offline demo mode**
+> (`MULTI_AGENT_OFFLINE=1`): FAISS retrieval over the two documents added in the sidebar is real, but the
+> agents' replies come from a deterministic `ScriptedLLM` (`offline.py`) that assembles JSON from the
+> retrieved text. It is **not** model output, and the app says so in a banner. The Ollama path
+> (`llama3.1:8b`) is implemented but was **not run** while preparing this README (no Ollama in the build
+> sandbox).
 
-## 📋 Prerequisites
+## Architecture
 
-1. **Install Ollama**: Download from [https://ollama.ai/](https://ollama.ai/)
-2. **Pull the model**:
-   ```bash
-   ollama pull llama3.1:8b
-   ```
-3. **Verify installation**:
-   ```bash
-   ollama serve
-   ```
-
-## 🔧 Installation
-
-1. **Clone and navigate**:
-   ```bash
-   git clone <repository-url>
-   cd langchain-demo
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## 🎯 Usage
-
-### Option 1: Command Line Interface
-```bash
-# Run the complete demo with sample documents
-python multi_agent_system.py
-
-# Interactive mode with menu options
-python interactive_demo.py
+```mermaid
+flowchart LR
+    T[Topic] --> R[RAG Agent<br/>FAISS retrieval]
+    R --> RS[Research Agent]
+    RS --> W[Writer Agent]
+    W --> C[Critic Agent<br/>score 1-10]
+    C -- "score < threshold<br/>and rounds left" --> W
+    C -- "score >= threshold" --> OUT[Article + review]
 ```
 
-### Option 2: Streamlit Web Interface
-```bash
-streamlit run streamlit_ui.py
-```
-Then open your browser to `http://localhost:8501`
+Every agent is an LCEL chain, `PromptTemplate | llm | JSONOutputParser`, and all agents share one LLM
+instance. The LLM and the embeddings are injectable (`MultiAgentSystem(llm=..., embeddings=...)`);
+the default is `OllamaLLM` + `OllamaEmbeddings`, imported lazily.
 
-### Option 3: Programmatic Usage
+The loop uses the settings that were already in `config.py` but were never wired up:
+`enable_iterative_improvement`, `max_iterations` (3) and `quality_threshold` (8.0). Per-round scores are
+recorded in the review's `metadata` (`scores_by_round`, `met_threshold`), so the shape of the result is unchanged.
+
+## Quick start
+
+**Without Ollama (offline demo, also what CI runs):**
+```bash
+pip install -r requirements.txt
+MULTI_AGENT_OFFLINE=1 streamlit run streamlit_ui.py     # web UI
+MULTI_AGENT_OFFLINE=1 python multi_agent_system.py      # CLI demo
+```
+
+**With Ollama:**
+```bash
+ollama pull llama3.1:8b && ollama serve
+pip install -r requirements.txt
+streamlit run streamlit_ui.py        # or: python multi_agent_system.py / python interactive_demo.py
+```
+Model names and the base URL live in `config.py` (`OLLAMA_MODEL`, `OLLAMA_EMBEDDING_MODEL`, `OLLAMA_BASE_URL`).
+
+**As a library:**
 ```python
 from multi_agent_system import MultiAgentSystem
 
-# Initialize system
-system = MultiAgentSystem()
-
-# Add documents to RAG
-documents = ["Your document content here..."]
-system.add_documents_to_rag(documents)
-
-# Run complete workflow
-results = system.run_workflow("Your research topic")
-
-# Run individual agents
-research_result = system.run_single_agent("research", "AI in education")
+system = MultiAgentSystem()                       # Ollama by default
+system.add_documents_to_rag(["Your document..."], [{"source": "my-doc"}])
+result = system.run_workflow("Your topic")        # dict of AgentResponse objects
+print(result["review"].metadata["scores_by_round"])
 ```
 
-## 🔄 Workflow Process
+## Tests
 
-1. **RAG Retrieval**: Searches document store for relevant information
-2. **Research Phase**: Generates comprehensive research summary with key concepts
-3. **Writing Phase**: Creates structured content (title, intro, body, conclusion)
-4. **Review Phase**: Provides detailed critique with numerical scoring
-5. **Coordination**: Combines all phases with metadata and status tracking
+```bash
+pip install -r requirements.txt pytest
+pytest -q        # 19 tests, ~1 s, no network, no Ollama
+```
+They cover JSON parsing, FAISS retrieval (a privacy query retrieves the privacy chunk, a volcano query the
+volcano chunk), each agent's JSON output, the revision loop (stops at the threshold, at `max_iterations`,
+or when disabled) and a Streamlit `AppTest` smoke test. CI runs them on Python 3.11 and 3.12.
 
-## 📁 Project Structure
+## What I fixed while modernising this repo
+
+- **Removed deprecated LangChain APIs** (`LLMChain`, `langchain.llms.Ollama`, `chain.run`, old import
+  paths) in favour of LCEL, `langchain_core`, `langchain_text_splitters` and `langchain_ollama`.
+- **Agent output was not valid JSON.** Parsed replies were stringified with `str(dict)` (single quotes), so
+  the UI's `json.loads` always failed and fell back to raw text. Replies are now serialised with `json.dumps`.
+- **The revision loop did not exist** although `config.py` promised it; it is implemented now.
+- **No way to run or test without a live model**: LLM and embeddings are injectable, with an offline backend.
+- The embeddings model name in `get_rag_status` was hard-coded; it now reports what is actually used.
+- Committed `__pycache__` removed, `.gitignore`, pinned-by-range requirements without unused packages
+  (`chainlit`, `streamlit-ace`, `ollama`, `requests`, `python-dotenv` were never imported).
+
+## Limitations
+
+- Output quality with a real model depends on `llama3.1:8b` following the JSON format; the parser falls back
+  to `{"content": text}` when it does not, and the critic's score is then unavailable (the loop stops).
+- `langchain-community` (FAISS, loaders) prints a sunset deprecation warning; migrating to the standalone
+  FAISS integration is the next step.
+- The scripted offline model produces templated text; it demonstrates the plumbing, not writing quality.
+- Uses one LLM for all roles; per-agent models are possible via the `llm=` argument but not exposed in the UI.
+
+## Project structure
 
 ```
-langchain-demo/
-├── multi_agent_system.py    # Core agent implementations
-├── streamlit_ui.py          # Web interface with visualizations
-├── interactive_demo.py      # Command-line interface
-├── config.py               # Configuration settings
-├── requirements.txt        # Python dependencies
-└── README.md              # This file
+multi_agent_system.py   agents, LCEL chains, RAG, coordinator + revision loop, create_system()
+offline.py              ScriptedLLM + HashingEmbeddings (offline demo and tests)
+streamlit_ui.py         web UI          interactive_demo.py   CLI menu
+config.py               models, workflow settings, prompts
+tests/                  pytest suite    scripts/capture_screenshots.py  regenerates docs/img
 ```
-
-## 🛠️ Configuration
-
-Edit `config.py` to customize:
-- **Model settings**: Temperature, max tokens, timeout
-- **Workflow behavior**: Iterations, quality thresholds
-- **Output options**: Save results, directory paths
-
-## 📊 Output Format
-
-All agents return structured JSON responses:
-```json
-{
-  "agent_name": "Research Agent",
-  "content": "{\"summary\": \"...\", \"key_concepts\": [...]}",
-  "metadata": {"task_type": "research", "rag_enhanced": true},
-  "timestamp": 1642742400.0
-}
-```
-
-## 🎮 Example Use Cases
-
-- **Academic Research**: Analyze documents and generate research summaries
-- **Content Creation**: Research → Write → Review workflow for articles
-- **Document Analysis**: RAG-powered Q&A on large document collections
-- **Knowledge Management**: Intelligent document search and synthesis
-- **Educational Tools**: Interactive learning with AI tutoring capabilities
-
-## 🔍 RAG System Details
-
-- **Embeddings**: Ollama embeddings with Llama3.1:8b
-- **Vector Store**: FAISS for efficient similarity search
-- **Text Splitting**: Recursive character splitting (1000 chars, 200 overlap)
-- **Document Types**: Text files, directories, programmatic text input
-
-## 🚨 Troubleshooting
-
-**Common Issues:**
-- Ensure Ollama service is running (`ollama serve`)
-- Verify model is downloaded (`ollama list`)
-- Check Python version compatibility (3.8+)
-- Install all requirements (`pip install -r requirements.txt`)
-
-**Performance Tips:**
-- Adjust chunk size in RAG configuration for different document types
-- Modify temperature settings for more/less creative outputs
-- Use quality thresholds to control content approval
