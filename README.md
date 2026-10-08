@@ -73,18 +73,6 @@ They cover JSON parsing, FAISS retrieval (a privacy query retrieves the privacy 
 volcano chunk), each agent's JSON output, the revision loop (stops at the threshold, at `max_iterations`,
 or when disabled) and a Streamlit `AppTest` smoke test. CI runs them on Python 3.11 and 3.12.
 
-## What I fixed while modernising this repo
-
-- **Removed deprecated LangChain APIs** (`LLMChain`, `langchain.llms.Ollama`, `chain.run`, old import
-  paths) in favour of LCEL, `langchain_core`, `langchain_text_splitters` and `langchain_ollama`.
-- **Agent output was not valid JSON.** Parsed replies were stringified with `str(dict)` (single quotes), so
-  the UI's `json.loads` always failed and fell back to raw text. Replies are now serialised with `json.dumps`.
-- **The revision loop did not exist** although `config.py` promised it; it is implemented now.
-- **No way to run or test without a live model**: LLM and embeddings are injectable, with an offline backend.
-- The embeddings model name in `get_rag_status` was hard-coded; it now reports what is actually used.
-- Committed `__pycache__` removed, `.gitignore`, pinned-by-range requirements without unused packages
-  (`chainlit`, `streamlit-ace`, `ollama`, `requests`, `python-dotenv` were never imported).
-
 ## Limitations
 
 - Output quality with a real model depends on `llama3.1:8b` following the JSON format; the parser falls back
