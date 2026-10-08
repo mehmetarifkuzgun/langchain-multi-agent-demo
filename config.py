@@ -5,6 +5,7 @@ Modify these settings to customize the behavior of your agents.
 
 # Ollama Model Configuration
 OLLAMA_MODEL = "llama3.1:8b"
+OLLAMA_EMBEDDING_MODEL = "llama3.1:8b"  # same model by default; swap for e.g. "nomic-embed-text"
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 # Agent Configuration
